@@ -88,6 +88,7 @@ textarea{width:100%;background:var(--panel2);border:1px solid var(--line);border
 .prog{height:10px;background:var(--panel2);border-radius:6px;overflow:hidden}
 .prog i{display:block;height:100%;width:0;background:var(--accent)}
 input[type=file]{display:none}
+#blk{position:fixed;inset:0;background:#0007;z-index:15}
 #toast{position:fixed;bottom:90px;inset-inline:16px;margin:auto;max-width:420px;background:#000d;border:1px solid var(--line);
   padding:10px 14px;border-radius:12px;text-align:center;opacity:0;transition:opacity .2s;pointer-events:none;z-index:50}
 #toast.show{opacity:1}
@@ -115,10 +116,12 @@ input[type=file]{display:none}
   <header><div class="ttl"><b id="shT"></b></div><button id="shX">✕</button></header>
   <div class="body" id="shB"></div>
 </div>
+<div id="blk" hidden></div>
 <div id="toast"></div>
 <input type="file" id="fMedia" accept="video/*,image/*,audio/*" multiple>
 <input type="file" id="fSrt" accept=".srt,text/plain">
 
+<script src="vendor/mp4-muxer.js"></script>
 <script>
 (() => {
 'use strict';
@@ -945,14 +948,129 @@ function pTrans() {
 }
 function pExport() {
   if (!total()) return toast('لا يوجد ما يُصدَّر.');
-  const b = openSheet('تصدير الفيديو', 'exp'); let q = 720;
+  const b = openSheet('تصدير الفيديو', 'exp'); let q = 720, mode = FAST_OK ? 'fast' : 'live';
+  if (FAST_OK) U.chips(b, [['fast', 'MP4 سريع (موصى به)'], ['live', 'تسجيل مباشر']], k => k === mode, k => { mode = k; refreshInfo(); }, 'الطريقة');
   U.chips(b, [[480, '480p'], [720, '720p'], [1080, '1080p']], k => k === q, k => q = k, 'الجودة');
-  const info = document.createElement('div'); info.className = 'hint';
-  info.textContent = 'التصدير يتم بزمن مساوٍ لمدة الفيديو (' + fmt(total()) + '). أبقِ الشاشة مفتوحة والتطبيق في المقدمة.';
-  b.appendChild(info);
+  const info = document.createElement('div'); info.className = 'hint'; b.appendChild(info);
+  const refreshInfo = () => { info.textContent = mode === 'fast'
+    ? 'ملف MP4 بمدة وصوت صحيحين. لا يعتمد على تشغيل الفيديو، لكن أبقِ التطبيق مفتوحاً حتى ينتهي.'
+    : 'تسجيل مباشر بزمن مساوٍ لمدة الفيديو (' + fmt(total()) + '). أبقِ الشاشة مفتوحة والتطبيق في المقدمة.'; };
+  refreshInfo();
   const pr = document.createElement('div'); pr.className = 'prog'; pr.innerHTML = '<i></i>'; pr.hidden = true; b.appendChild(pr);
-  const go = U.btn(b, '⏺ ابدأ التصدير', () => { go.disabled = true; pr.hidden = false; startExport(q, pr.firstChild, info, go); }, 'primary');
-  U.btn(b, 'إلغاء التصدير', () => { if (exporting) { exporting.cancel = true; stop(); } });
+  const box = document.createElement('div'); box.className = 'chips'; b.appendChild(box);
+  const go = U.btn(box, '⏺ ابدأ التصدير', async () => {
+    go.disabled = true; pr.hidden = false; shareBtn.hidden = true;
+    if (mode === 'live') { startExport(q, pr.firstChild, info, go); return; }
+    const job = fastJob = { cancel: false };
+    $('blk').hidden = false;
+    try {
+      const out = await exportFast(q, job, (p, msg) => { pr.firstChild.style.width = Math.round(p * 100) + '%'; info.textContent = msg; });
+      lastFile = out; info.textContent = 'تم التصدير (' + (out.size / 1048576).toFixed(1) + ' م.ب) — ' + out.name;
+      shareBtn.hidden = !(navigator.canShare && navigator.canShare({ files: [out] }));
+      dl(out, out.name);
+    } catch (e) {
+      if (e === 'cancel') { info.textContent = 'أُلغي التصدير.'; }
+      else { console.warn('fast export failed', e); info.textContent = 'تعذّر التصدير السريع (' + (e && e.message || e) + ') — جارٍ التحويل إلى التسجيل المباشر…'; $('blk').hidden = true; startExport(q, pr.firstChild, info, go); return; }
+    } finally { fastJob = null; $('blk').hidden = true; go.disabled = false; syncMedia(T, false); dirty = true; }
+  }, 'primary');
+  U.btn(box, 'إلغاء', () => { if (fastJob) fastJob.cancel = true; else if (exporting) { exporting.cancel = true; stop(); } });
+  const shareBtn = U.btn(box, '📤 مشاركة', async () => { try { await navigator.share({ files: [lastFile], title: 'Delbaz _EPS' }); } catch (e) {} }); shareBtn.hidden = true;
+}
+
+/* ================= fast export (WebCodecs + mp4-muxer) ================= */
+const FAST_OK = typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined' && typeof Mp4Muxer !== 'undefined';
+let fastJob = null, lastFile = null; const audioCache = {};
+async function decodeAsset(a) {
+  if (audioCache[a.id] !== undefined) return audioCache[a.id];
+  let buf = null;
+  try { const ab = await a.blob.arrayBuffer(); buf = await new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(2, 1, 48000).decodeAudioData(ab); } catch (e) { buf = null; }
+  return audioCache[a.id] = buf;
+}
+async function mixAudio(tot, sr) {
+  const oc = new OfflineAudioContext(2, Math.ceil(tot * sr), sr); let any = false;
+  for (const c of allClips()) {
+    if ((c.kind !== 'video' && c.kind !== 'audio') || c.vol <= 0) continue;
+    const a = assets[c.asset]; if (!a) continue; const buf = await decodeAsset(a); if (!buf) continue;
+    const src = oc.createBufferSource(); src.buffer = buf; src.playbackRate.value = c.speed;
+    const g = oc.createGain(), t0 = c.start, t1 = c.start + c.dur, fi = Math.min(c.afi, c.dur), fo = Math.min(c.afo, c.dur);
+    g.gain.setValueAtTime(fi > 0 ? 0 : c.vol, t0); if (fi > 0) g.gain.linearRampToValueAtTime(c.vol, t0 + fi);
+    if (fo > 0) { g.gain.setValueAtTime(c.vol, Math.max(t0 + fi, t1 - fo)); g.gain.linearRampToValueAtTime(0, t1); }
+    src.connect(g); g.connect(oc.destination); src.start(t0, c.in); src.stop(t1); any = true;
+  }
+  return any ? oc.startRendering() : null;
+}
+async function seekAllAt(t) {
+  const waits = [];
+  for (const c of allClips()) {
+    if (c.kind !== 'video' || !assets[c.asset]) continue;
+    const el = getEl(c).el; if (!el.paused) el.pause(); el.muted = true;
+    if (!(t >= c.start - 1e-6 && t < c.start + c.dur) && !holdWindow(c, t)) continue;
+    if (el.readyState < 2) waits.push(new Promise(res => { const f = () => { el.removeEventListener('loadeddata', f); res(); }; el.addEventListener('loadeddata', f); setTimeout(f, 4000); }));
+    const target = srcTime(c, t);
+    if (Math.abs(el.currentTime - target) > 0.008) waits.push(new Promise(res => {
+      let done = false; const f = () => { if (done) return; done = true; el.removeEventListener('seeked', f); res(); };
+      el.addEventListener('seeked', f); setTimeout(f, 3000); try { el.currentTime = target; } catch (x) { f(); } }));
+  }
+  await Promise.all(waits);
+}
+async function exportFast(q, job, progress) {
+  const tot = total(), fps = 30, t00 = performance.now();
+  const sc = q / Math.min(P.pw, P.ph), W = Math.round(P.pw * sc / 2) * 2, H = Math.round(P.ph * sc / 2) * 2;
+  if (playing) stop();
+  const vbase = { width: W, height: H, bitrate: q >= 1080 ? 10e6 : q >= 720 ? 6e6 : 3e6, framerate: fps };
+  let vc = null;
+  for (const [fam, str] of [['avc', 'avc1.64002A'], ['avc', 'avc1.4D4028'], ['avc', 'avc1.42E01F'], ['vp9', 'vp09.00.40.08'], ['av1', 'av01.0.08M.08']]) {
+    try { const r = await VideoEncoder.isConfigSupported(Object.assign({ codec: str }, vbase, fam === 'avc' ? { avc: { format: 'avc' } } : {})); if (r.supported) { vc = [fam, str]; break; } } catch (e) {}
+  }
+  if (!vc) throw new Error('لا يوجد مرمّز فيديو');
+  let ac = null;
+  if (typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined') for (const [fam, str] of [['aac', 'mp4a.40.2'], ['opus', 'opus']]) {
+    try { const r = await AudioEncoder.isConfigSupported({ codec: str, sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 }); if (r.supported) { ac = [fam, str]; break; } } catch (e) {}
+  }
+  progress(0.01, 'تجهيز الصوت…');
+  const mix = ac ? await mixAudio(tot, 48000) : null;
+  if (job.cancel) throw 'cancel';
+  const target = new Mp4Muxer.ArrayBufferTarget();
+  const muxer = new Mp4Muxer.Muxer({ target, fastStart: 'in-memory', firstTimestampBehavior: 'offset',
+    video: { codec: vc[0], width: W, height: H, frameRate: fps }, audio: mix ? { codec: ac[0], numberOfChannels: 2, sampleRate: 48000 } : undefined });
+  let encErr = null;
+  if (mix) {
+    const aenc = new AudioEncoder({ output: (ch, meta) => muxer.addAudioChunk(ch, meta), error: e => encErr = e });
+    aenc.configure({ codec: ac[1], sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
+    const L = mix.getChannelData(0), R = mix.getChannelData(1), step = 48000;
+    for (let o = 0; o < L.length; o += step) {
+      const len = Math.min(step, L.length - o), data = new Float32Array(len * 2); data.set(L.subarray(o, o + len), 0); data.set(R.subarray(o, o + len), len);
+      const ad = new AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: len, numberOfChannels: 2, timestamp: Math.round(o * 1e6 / 48000), data });
+      aenc.encode(ad); ad.close();
+    }
+    await aenc.flush(); aenc.close(); if (encErr) throw encErr;
+  }
+  const venc = new VideoEncoder({ output: (ch, meta) => muxer.addVideoChunk(ch, meta), error: e => encErr = e });
+  venc.configure(Object.assign({ codec: vc[1] }, vbase, vc[0] === 'avc' ? { avc: { format: 'avc' } } : {}));
+  const cvs2 = document.createElement('canvas'); cvs2.width = W; cvs2.height = H; const g = cvs2.getContext('2d');
+  const n = Math.max(1, Math.ceil(tot * fps));
+  try {
+    for (let i = 0; i < n; i++) {
+      if (job.cancel) throw 'cancel';
+      const t = Math.min(i / fps, Math.max(0, tot - 1e-3));
+      await seekAllAt(t); renderFrame(g, W, H, t);
+      const vf = new VideoFrame(cvs2, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      venc.encode(vf, { keyFrame: i % (fps * 2) === 0 }); vf.close();
+      while (venc.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 4));
+      if (encErr) throw encErr;
+      if (i % 5 === 0 || i === n - 1) {
+        const el = (performance.now() - t00) / 1000, eta = el / (i + 1) * (n - i - 1);
+        progress(0.05 + 0.93 * (i + 1) / n, `جارٍ التصدير… ${Math.round((i + 1) / n * 100)}% — المتبقي ≈ ${Math.ceil(eta)} ث`);
+        cx.setTransform(1, 0, 0, 1, 0, 0); cx.drawImage(cvs2, 0, 0, cv.width, cv.height);
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    await venc.flush(); venc.close(); if (encErr) throw encErr;
+  } finally { for (const c of allClips()) if (els[c.id]) els[c.id].el.muted = false; }
+  muxer.finalize();
+  const file = new File([target.buffer], 'delbaz_eps_video.mp4', { type: 'video/mp4' });
+  window.__lastExport = { size: file.size, mime: 'video/mp4', fast: true, vcodec: vc[1], acodec: mix ? ac[1] : null, seconds: (performance.now() - t00) / 1000 };
+  return file;
 }
 
 /* ================= export ================= */

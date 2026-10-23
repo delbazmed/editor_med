@@ -1,5 +1,5 @@
-const CACHE = 'delbaz-eps-editor-v2';
-const FILES = ['./', './index.html', './manifest.json', './icon.svg', './icon-192.png', './icon-512.png'];
+const CACHE = 'delbaz-eps-editor-v3';
+const FILES = ['./', './index.html', './manifest.json', './icon.svg', './icon-192.png', './icon-512.png', './vendor/mp4-muxer.js'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
