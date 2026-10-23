@@ -2,14 +2,27 @@ name: Deploy to Firebase Hosting
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: FirebaseExtended/action-hosting-deploy@v0
+      - uses: actions/setup-node@v4
         with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          channelId: live
-          projectId: editormed-2c754
+          node-version: 22
+      - name: Deploy to editormed-2c754
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          printf '%s' "$SA" > "$RUNNER_TEMP/sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
+          set +e
+          npx -y firebase-tools@latest deploy --only hosting --project editormed-2c754 --non-interactive > out.txt 2>&1
+          code=$?
+          rm -f "$RUNNER_TEMP/sa.json"
+          if [ $code -ne 0 ]; then
+            echo "::error title=firebase-deploy-failed::$(tail -n 14 out.txt | grep -vi 'private_key' | tr '\n' '|' | cut -c1-900)"
+            exit $code
+          fi
+          echo "::notice title=firebase-deploy-ok::$(tail -n 4 out.txt | tr '\n' '|' | cut -c1-400)"
